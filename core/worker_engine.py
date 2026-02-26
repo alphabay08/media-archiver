@@ -1,8 +1,9 @@
 import os
+import time
 import logging
 
 from core.state_manager import StateManager
-from core.retry_controller import is_retryable, should_pause, backoff_delay, inter_download_delay
+from core.retry_controller import is_retryable, backoff_delay, inter_download_delay
 from modules.downloader import download, download_all
 from modules.dropbox_uploader import upload_file
 from modules.platform_detector import detect_platform, guess_media_type
@@ -13,17 +14,30 @@ MAX_RETRIES            = int(os.environ.get("MAX_RETRIES", 3))
 QUEUE_THRESHOLD        = int(os.environ.get("QUEUE_TRIGGER_THRESHOLD", 3))
 CONSECUTIVE_FAIL_LIMIT = 10
 
+# How long to pause the worker when Instagram rate limits us (seconds)
+# Links are NOT lost — they stay in queue and retry after cooldown
+RATE_LIMIT_PAUSE       = int(os.environ.get("RATE_LIMIT_COOLDOWN", 300))  # 5 min default
+
 _PERMANENT_ERRORS = [
     "unsupported url", "cannot parse data",
-    "playlist returned no entries", "private video", "login required",
-    "not available", "has been removed", "page not found", "404",
+    "playlist returned no entries",
+    "has been removed", "page not found",
     "content is not available", "this reel can't be played",
-    "video unavailable", "does not exist",
+    "video unavailable", "does not exist", "media not found",
+    "no media", "private",
 ]
 
 
 def _is_permanent(error: str) -> bool:
-    return any(s in error.lower() for s in _PERMANENT_ERRORS)
+    err = error.lower()
+    # Never treat rate limit errors as permanent
+    if "rate_limited" in err or "rate limit" in err:
+        return False
+    return any(s in err for s in _PERMANENT_ERRORS)
+
+
+def _is_rate_limited(error: str) -> bool:
+    return "instagram_rate_limited" in error.lower() or "rate_limited" in error.lower()
 
 
 def run_worker(force: bool = False):
@@ -69,31 +83,50 @@ def run_worker(force: bool = False):
                 sm.mark_failed(url, "Unrecognized platform", permanent=True)
                 continue
 
-            # ── DOWNLOAD ALL ITEMS (handles single/carousel/mixed) ──
+            # ── DOWNLOAD ALL ITEMS ──────────────────────────────────
             results = download_all(url, platform)
 
             # ── ALL ITEMS FAILED ────────────────────────────────────
             if not any(r.success for r in results):
-                error = results[0].error if results else "Unknown error"
+                error        = results[0].error if results else "Unknown error"
+                rate_limited = any(getattr(r, "rate_limited", False) for r in results)
+
                 logger.error(f"All downloads failed [{url[:60]}]: {error[:120]}")
 
+                # ── RATE LIMITED — pause worker, keep link in queue ─
+                if rate_limited or _is_rate_limited(error):
+                    # Put link back as pending so it retries after cooldown
+                    sm.mark_failed(url, error, permanent=False)
+                    logger.warning(
+                        f"Instagram rate limit hit — pausing worker for {RATE_LIMIT_PAUSE}s. "
+                        f"Links remain in queue and will retry automatically."
+                    )
+                    sm.set_worker_status("idle")  # set idle so next /run trigger works
+
+                    # Sleep here — Render keeps the process alive during /run
+                    logger.info(f"Sleeping {RATE_LIMIT_PAUSE}s before releasing worker...")
+                    time.sleep(RATE_LIMIT_PAUSE)
+                    logger.info("Cooldown complete — worker releasing.")
+
+                    # Return so VM can re-trigger the worker fresh
+                    return {
+                        "status": "rate_limited_cooldown",
+                        "message": f"Paused {RATE_LIMIT_PAUSE}s due to Instagram rate limit. Links preserved.",
+                        "processed": processed_count
+                    }
+
+                # ── PERMANENT ERROR — mark and skip ────────────────
                 if _is_permanent(error):
                     sm.mark_failed(url, error, permanent=True)
                     consecutive_failures = 0
                     continue
 
-                if should_pause(error):
-                    sm.mark_failed(url, error)
-                    reason = f"Platform blocking: {error}"
-                    sm.set_worker_status("paused", reason=reason)
-                    logger.critical(f"Worker auto-paused: {reason}")
-                    return {"status": "paused", "reason": reason}
-
+                # ── RETRYABLE ERROR ─────────────────────────────────
                 consecutive_failures += 1
                 if consecutive_failures >= CONSECUTIVE_FAIL_LIMIT:
                     sm.mark_failed(url, error)
-                    sm.set_worker_status("paused", reason="consecutive_failure_limit")
-                    return {"status": "paused", "reason": "consecutive_failure_limit"}
+                    sm.set_worker_status("idle")
+                    return {"status": "too_many_failures", "processed": processed_count}
 
                 if is_retryable(error):
                     sm.mark_failed(url, error)
@@ -116,46 +149,39 @@ def run_worker(force: bool = False):
                 item_num = i + 1
 
                 if not result.success:
-                    logger.warning(f"  Skipping item {item_num}/{total_items} (download failed): {result.error[:80]}")
+                    logger.warning(f"  Skipping item {item_num}/{total_items}: {result.error[:80]}")
                     continue
 
-                # Determine media type
                 actual_media_type = result.media_type or guess_media_type(url)
-
                 logger.info(f"  Uploading item {item_num}/{total_items} [{actual_media_type}]...")
 
-                # Upload to Dropbox
                 success, path_or_err = upload_file(result.file_path, platform, actual_media_type)
 
-                # Always clean up temp file after upload attempt
+                # Clean up temp file
                 try:
                     if result.file_path and os.path.exists(result.file_path):
                         os.remove(result.file_path)
-                        logger.debug(f"  Temp file deleted: {result.file_path}")
                 except Exception as e:
                     logger.warning(f"  Could not delete temp file: {e}")
 
                 if success:
                     last_upload_path = path_or_err
                     uploaded_count  += 1
-                    logger.info(f"  ✓ Item {item_num}/{total_items} uploaded: {path_or_err}")
+                    logger.info(f"  ✓ Item {item_num}/{total_items} → {path_or_err}")
                 else:
                     logger.error(f"  ✗ Item {item_num}/{total_items} upload failed: {path_or_err[:120]}")
 
             # ── MARK FINAL STATUS ───────────────────────────────────
             if uploaded_count > 0:
                 sm.mark_completed(url, last_upload_path)
-                logger.info(
-                    f"Completed [{url[:60]}]: "
-                    f"{uploaded_count}/{total_items} item(s) uploaded"
-                )
+                logger.info(f"Completed [{url[:60]}]: {uploaded_count}/{total_items} item(s) uploaded")
             else:
                 sm.mark_failed(url, "All uploads failed", permanent=True)
                 logger.error(f"All uploads failed for: {url[:60]}")
 
             processed_count += 1
 
-            # Delay between different posts (not between items of same post)
+            # Polite delay between posts to avoid rate limits
             if sm.count_pending() > 0:
                 inter_download_delay()
 
