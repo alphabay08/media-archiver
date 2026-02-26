@@ -2,6 +2,7 @@ import os
 import re
 import time
 import uuid
+import random
 import logging
 import tempfile
 import json
@@ -228,6 +229,11 @@ def _download_instagram(url: str, base_prefix: str) -> list:
 
     # ── GET MEDIA INFO ─────────────────────────────────────────────────
     try:
+        # Human-like random delay before each API call
+        delay = random.uniform(3, 8)
+        logger.info(f"Human delay: {delay:.1f}s")
+        time.sleep(delay)
+
         media_pk = cl.media_pk_from_code(shortcode)
         media    = cl.media_info(media_pk)
     except Exception as e:
