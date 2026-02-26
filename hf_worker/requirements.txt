@@ -1,0 +1,7 @@
+fastapi==0.109.2
+uvicorn==0.27.0
+requests==2.31.0
+aiofiles==23.2.1
+python-dotenv==1.0.0
+yt-dlp>=2024.12.13
+dropbox>=11.36.0
