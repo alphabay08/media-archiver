@@ -337,6 +337,30 @@ def download_all(url: str, platform: str) -> list:
         info        = _extract_info_only(url, probe_opts2)
 
     if info is None:
+        # Probe failed — if it's a /p/ URL it's likely a photo, attempt direct download
+        if "/p/" in url.lower():
+            logger.info(f"Probe failed for /p/ URL — attempting direct photo download: {url[:80]}")
+            item_prefix = base_prefix + "_direct"
+            opts        = _universal_opts(item_prefix + ".%(ext)s")
+            result      = _download_entry(url, item_prefix, opts)
+            if result.success:
+                return [result]
+            # If direct also failed, try as carousel (some /p/ posts are albums)
+            logger.info(f"Direct download failed too — trying carousel extraction: {url[:80]}")
+            carousel_opts = _universal_opts(base_prefix + "_carousel_probe.%(ext)s")
+            info2 = None
+            try:
+                carousel_opts_dl = dict(carousel_opts)
+                carousel_opts_dl["extract_flat"] = False
+                with yt_dlp.YoutubeDL(carousel_opts_dl) as ydl:
+                    info2 = ydl.extract_info(url, download=False)
+            except Exception:
+                pass
+            if info2 and info2.get("entries"):
+                entries2 = [e for e in info2["entries"] if e]
+                if entries2:
+                    return _download_carousel(entries2, base_prefix)
+            return [result]  # Return original failure
         logger.error(f"Could not probe URL: {url[:80]}")
         return [DownloadResult(False, error="Could not extract info from URL — may be private or unavailable")]
 
