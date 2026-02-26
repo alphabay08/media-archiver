@@ -1,9 +1,11 @@
 import os
+import re
 import uuid
 import logging
 import tempfile
 import json
 import base64
+import requests
 import yt_dlp
 from pathlib import Path
 
@@ -12,7 +14,8 @@ logger = logging.getLogger(__name__)
 _DATA_DIR = Path(os.environ.get("DATA_DIR", str(Path(__file__).parent.parent / "data")))
 TEMP_DIR  = _DATA_DIR / "tmp"
 
-_COOKIE_FILE_PATH = None
+_COOKIE_FILE_PATH    = None
+_INSTAGRAPI_CLIENT   = None
 
 
 # ─────────────────────────────────────────────
@@ -60,6 +63,197 @@ def _get_cookie_file():
 
 
 # ─────────────────────────────────────────────
+# INSTAGRAPI CLIENT (for photo downloads)
+# ─────────────────────────────────────────────
+
+def _get_instagrapi_client():
+    """Get or create a logged-in instagrapi client using SESSION_B64."""
+    global _INSTAGRAPI_CLIENT
+    if _INSTAGRAPI_CLIENT is not None:
+        return _INSTAGRAPI_CLIENT
+
+    b64 = os.environ.get("INSTAGRAM_SESSION_B64", "").strip()
+    if not b64:
+        logger.warning("INSTAGRAM_SESSION_B64 not set — cannot use instagrapi for photos.")
+        return None
+
+    try:
+        from instagrapi import Client
+        session_data = json.loads(base64.b64decode(b64).decode())
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, prefix="ig_session_")
+        json.dump(session_data, tmp)
+        tmp.close()
+
+        cl = Client()
+        cl.delay_range = [1, 3]
+        cl.load_settings(tmp.name)
+        cl.get_timeline_feed()  # verify session is valid
+        _INSTAGRAPI_CLIENT = cl
+        logger.info("instagrapi client initialized from SESSION_B64.")
+        return cl
+    except Exception as e:
+        logger.error(f"Failed to initialize instagrapi client: {e}")
+        return None
+
+
+def _extract_shortcode(url: str) -> str:
+    """Extract Instagram shortcode from a /p/ URL."""
+    match = re.search(r"/p/([A-Za-z0-9_\-]+)", url)
+    return match.group(1) if match else None
+
+
+# ─────────────────────────────────────────────
+# INSTAGRAPI PHOTO DOWNLOADER
+# ─────────────────────────────────────────────
+
+def _download_photos_instagrapi(url: str, base_prefix: str) -> list:
+    """
+    Download photos (single or carousel) using instagrapi.
+    Falls back gracefully if instagrapi is unavailable.
+    """
+    cl = _get_instagrapi_client()
+    if cl is None:
+        return [DownloadResult(False, error="instagrapi not available — cannot download photos")]
+
+    shortcode = _extract_shortcode(url)
+    if not shortcode:
+        return [DownloadResult(False, error=f"Could not extract shortcode from URL: {url}")]
+
+    try:
+        media_pk = cl.media_pk_from_code(shortcode)
+        media    = cl.media_info(media_pk)
+    except Exception as e:
+        return [DownloadResult(False, error=f"instagrapi media_info failed: {e}")]
+
+    media_type_id = media.media_type  # 1=photo, 2=video, 8=carousel
+
+    logger.info(f"instagrapi: media_type={media_type_id}, shortcode={shortcode}")
+
+    results = []
+
+    # ── CAROUSEL (type 8) ─────────────────────────────────────────────
+    if media_type_id == 8:
+        resources = media.resources or []
+        total     = len(resources)
+        logger.info(f"instagrapi carousel: {total} item(s)")
+
+        for i, resource in enumerate(resources):
+            item_num   = i + 1
+            item_type  = resource.media_type  # 1=photo, 2=video
+            item_prefix = f"{base_prefix}_ig_item{item_num:03d}"
+
+            if item_type == 2:
+                # Video inside carousel
+                video_url = str(resource.video_url) if resource.video_url else None
+                if video_url:
+                    logger.info(f"  [{item_num}/{total}] Downloading carousel video via yt-dlp")
+                    opts   = _video_opts(item_prefix + ".%(ext)s")
+                    result = _download_entry(video_url, item_prefix, opts)
+                    if not result.success:
+                        opts2  = _universal_opts(item_prefix + "_fb.%(ext)s")
+                        result = _download_entry(video_url, item_prefix + "_fb", opts2)
+                else:
+                    result = DownloadResult(False, error=f"No video URL for carousel item {item_num}")
+            else:
+                # Photo inside carousel
+                photo_url = _best_photo_url(resource)
+                if photo_url:
+                    logger.info(f"  [{item_num}/{total}] Downloading carousel photo")
+                    result = _download_direct_url(photo_url, item_prefix, "jpg")
+                else:
+                    result = DownloadResult(False, error=f"No photo URL for carousel item {item_num}")
+
+            if result.success:
+                size_mb = Path(result.file_path).stat().st_size / (1024 * 1024)
+                logger.info(f"  [{item_num}/{total}] {Path(result.file_path).name} [{result.media_type}] [{size_mb:.2f}MB]")
+            else:
+                logger.warning(f"  [{item_num}/{total}] FAILED: {result.error}")
+
+            results.append(result)
+
+    # ── SINGLE VIDEO (type 2) ─────────────────────────────────────────
+    elif media_type_id == 2:
+        video_url = str(media.video_url) if media.video_url else None
+        if video_url:
+            logger.info(f"instagrapi: single video — downloading via yt-dlp")
+            item_prefix = base_prefix + "_ig_video"
+            opts        = _video_opts(item_prefix + ".%(ext)s")
+            result      = _download_entry(video_url, item_prefix, opts)
+            if not result.success:
+                opts2  = _universal_opts(item_prefix + "_fb.%(ext)s")
+                result = _download_entry(video_url, item_prefix + "_fb", opts2)
+            results.append(result)
+        else:
+            results.append(DownloadResult(False, error="No video URL from instagrapi"))
+
+    # ── SINGLE PHOTO (type 1) ─────────────────────────────────────────
+    else:
+        photo_url = _best_photo_url(media)
+        if photo_url:
+            logger.info(f"instagrapi: single photo — downloading directly")
+            item_prefix = base_prefix + "_ig_photo"
+            result      = _download_direct_url(photo_url, item_prefix, "jpg")
+            results.append(result)
+        else:
+            results.append(DownloadResult(False, error="No photo URL from instagrapi"))
+
+    success_count = sum(1 for r in results if r.success)
+    logger.info(f"instagrapi download complete: {success_count}/{len(results)} succeeded")
+    return results
+
+
+def _best_photo_url(media_obj) -> str:
+    """Get the highest resolution photo URL from an instagrapi media object."""
+    # Try thumbnail_url candidates
+    candidates = []
+
+    if hasattr(media_obj, "image_versions2") and media_obj.image_versions2:
+        try:
+            versions = media_obj.image_versions2.get("candidates", [])
+            if versions:
+                # Sort by resolution (width * height descending)
+                best = sorted(versions, key=lambda v: v.get("width", 0) * v.get("height", 0), reverse=True)
+                if best:
+                    candidates.append(best[0].get("url"))
+        except Exception:
+            pass
+
+    if hasattr(media_obj, "thumbnail_url") and media_obj.thumbnail_url:
+        candidates.append(str(media_obj.thumbnail_url))
+
+    for url in candidates:
+        if url:
+            return url
+    return None
+
+
+def _download_direct_url(url: str, file_prefix: str, ext: str) -> DownloadResult:
+    """Download a direct image/video URL using requests (no yt-dlp needed)."""
+    file_path = file_prefix + f".{ext}"
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+            "Referer": "https://www.instagram.com/",
+        }
+        resp = requests.get(url, headers=headers, stream=True, timeout=60)
+        resp.raise_for_status()
+
+        with open(file_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+
+        if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+            return DownloadResult(False, error="Downloaded file is empty")
+
+        media_type = _detect_media_type_from_file(file_path)
+        return DownloadResult(True, file_path=file_path, media_type=media_type)
+
+    except Exception as e:
+        return DownloadResult(False, error=f"Direct download failed: {e}")
+
+
+# ─────────────────────────────────────────────
 # YT-DLP OPTIONS
 # ─────────────────────────────────────────────
 
@@ -100,7 +294,6 @@ def _video_opts(output_template: str) -> dict:
 
 
 def _universal_opts(output_template: str) -> dict:
-    """Works for both photos and videos — no format restriction."""
     opts = _common_opts(output_template)
     opts["format"] = "best"
     return opts
@@ -128,23 +321,19 @@ class DownloadResult:
 # ─────────────────────────────────────────────
 
 def _detect_media_type_from_entry(entry: dict) -> str:
-    """Detect if a yt-dlp entry is a photo or video."""
     ext    = (entry.get("ext") or "").lower()
     vcodec = (entry.get("vcodec") or "none").lower()
     acodec = (entry.get("acodec") or "none").lower()
-
     if ext in ("jpg", "jpeg", "png", "webp", "gif"):
         return "Images"
     if vcodec not in ("none", "") or ext in ("mp4", "mkv", "webm", "mov", "avi"):
         return "Videos"
-    # No video codec and no image ext — treat as image
     if vcodec in ("none", "") and acodec in ("none", ""):
         return "Images"
     return "Videos"
 
 
 def _detect_media_type_from_file(file_path: str) -> str:
-    """Detect media type from actual file extension."""
     ext = Path(file_path).suffix.lower().lstrip(".")
     if ext in ("jpg", "jpeg", "png", "webp", "gif"):
         return "Images"
@@ -154,20 +343,17 @@ def _detect_media_type_from_file(file_path: str) -> str:
 
 
 def _find_files_by_prefix(prefix: str) -> list:
-    """Find all downloaded files matching a prefix, sorted by name."""
     prefix_name = Path(prefix).name
     try:
-        files = sorted([
+        return sorted([
             str(f) for f in TEMP_DIR.iterdir()
             if f.name.startswith(prefix_name) and f.is_file() and f.stat().st_size > 0
         ])
-        return files
     except Exception:
         return []
 
 
 def _find_one_file(prefix: str):
-    """Find the largest file matching a prefix."""
     files = _find_files_by_prefix(prefix)
     if not files:
         return None
@@ -184,7 +370,6 @@ def _log_item(index: int, total: int, file_path: str, media_type: str):
 # ─────────────────────────────────────────────
 
 def _extract_info_only(url: str, opts: dict):
-    """Extract metadata without downloading. Returns info dict or None."""
     probe_opts = dict(opts)
     probe_opts["quiet"]       = True
     probe_opts["no_warnings"] = True
@@ -196,14 +381,10 @@ def _extract_info_only(url: str, opts: dict):
 
 
 # ─────────────────────────────────────────────
-# SINGLE ENTRY DOWNLOAD
+# SINGLE ENTRY DOWNLOAD (yt-dlp)
 # ─────────────────────────────────────────────
 
 def _download_entry(url: str, file_prefix: str, opts: dict) -> DownloadResult:
-    """
-    Download a single URL with given opts.
-    Returns DownloadResult with correct media_type.
-    """
     output_template = file_prefix + ".%(ext)s"
     opts = dict(opts)
     opts["outtmpl"] = output_template
@@ -213,21 +394,16 @@ def _download_entry(url: str, file_prefix: str, opts: dict) -> DownloadResult:
             info = ydl.extract_info(url, download=True)
             if info is None:
                 return DownloadResult(False, error="yt-dlp returned no info")
-
-            # If it returned a playlist unexpectedly, take first entry
             if info.get("entries"):
                 entries = [e for e in info["entries"] if e]
                 if not entries:
                     return DownloadResult(False, error="Empty playlist")
                 info = entries[0]
-
             downloaded = _find_one_file(file_prefix)
             if not downloaded:
                 return DownloadResult(False, error="File not found on disk after download")
-
             media_type = _detect_media_type_from_file(downloaded)
             return DownloadResult(True, file_path=downloaded, media_type=media_type)
-
     except yt_dlp.utils.DownloadError as e:
         return DownloadResult(False, error=str(e))
     except Exception as e:
@@ -239,16 +415,8 @@ def _download_entry(url: str, file_prefix: str, opts: dict) -> DownloadResult:
 # ─────────────────────────────────────────────
 
 def _download_carousel(entries: list, base_prefix: str) -> list:
-    """
-    Download each carousel item one by one.
-    Works for:
-      - Multiple photos (20+ supported)
-      - Mixed photos + videos
-      - Any combination
-    """
     total   = len(entries)
     results = []
-
     logger.info(f"Starting carousel download: {total} item(s)")
 
     for i, entry in enumerate(entries):
@@ -262,23 +430,17 @@ def _download_carousel(entries: list, base_prefix: str) -> list:
             results.append(DownloadResult(False, error=f"No URL for item {item_num}"))
             continue
 
-        # Detect expected media type from entry metadata
         expected_type = _detect_media_type_from_entry(entry)
         logger.info(f"  [{item_num}/{total}] Downloading [{expected_type}]: {item_id}")
 
-        # Choose opts based on expected type
         if expected_type == "Videos":
             opts   = _video_opts(item_prefix + ".%(ext)s")
             result = _download_entry(item_url, item_prefix, opts)
-
-            # If video opts fail, retry with universal (might actually be a photo)
             if not result.success:
-                logger.info(f"  [{item_num}/{total}] Video opts failed, retrying with universal opts")
+                logger.info(f"  [{item_num}/{total}] Video opts failed, retrying universal")
                 opts2  = _universal_opts(item_prefix + "_retry.%(ext)s")
                 result = _download_entry(item_url, item_prefix + "_retry", opts2)
-
         else:
-            # Photo — use universal opts
             opts   = _universal_opts(item_prefix + ".%(ext)s")
             result = _download_entry(item_url, item_prefix, opts)
 
@@ -290,9 +452,7 @@ def _download_carousel(entries: list, base_prefix: str) -> list:
         results.append(result)
 
     success_count = sum(1 for r in results if r.success)
-    fail_count    = total - success_count
-    logger.info(f"Carousel done: {success_count}/{total} succeeded, {fail_count}/{total} failed")
-
+    logger.info(f"Carousel done: {success_count}/{total} succeeded")
     return results
 
 
@@ -301,7 +461,6 @@ def _download_carousel(entries: list, base_prefix: str) -> list:
 # ─────────────────────────────────────────────
 
 def download(url: str, platform: str) -> DownloadResult:
-    """Download single item. Returns first successful result."""
     results = download_all(url, platform)
     for r in results:
         if r.success:
@@ -313,113 +472,99 @@ def download_all(url: str, platform: str) -> list:
     """
     Download ALL items from a URL, one by one (incremental).
 
-    Handles all 3 cases:
-      Case 1 — Single photo     → downloads 1 image
-      Case 2 — Multiple photos  → downloads each photo one by one (20+ supported)
-      Case 3 — Mixed (photo+video) carousel → downloads each item one by one
-
-    Returns list of DownloadResult objects.
+    Strategy:
+      - Reels / Facebook videos  → yt-dlp (fast, reliable)
+      - /p/ posts (photo/carousel) → yt-dlp probe first,
+                                     fallback to instagrapi if yt-dlp fails
     """
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
     unique_id   = uuid.uuid4().hex
     base_prefix = str(TEMP_DIR / f"{platform}_{unique_id}")
+    url_lower   = url.lower()
 
     logger.info(f"Probing URL: {url[:80]}")
 
-    # ── STEP 1: Probe the URL to understand content type ──
-    probe_opts = _universal_opts(base_prefix + "_probe.%(ext)s")
-    info       = _extract_info_only(url, probe_opts)
-
-    if info is None:
-        # Try video opts as second probe attempt
-        probe_opts2 = _video_opts(base_prefix + "_probe2.%(ext)s")
-        info        = _extract_info_only(url, probe_opts2)
-
-    if info is None:
-        # Probe failed — if it's a /p/ URL it's likely a photo, attempt direct download
-        if "/p/" in url.lower():
-            logger.info(f"Probe failed for /p/ URL — attempting direct photo download: {url[:80]}")
-            item_prefix = base_prefix + "_direct"
-            opts        = _universal_opts(item_prefix + ".%(ext)s")
-            result      = _download_entry(url, item_prefix, opts)
-            if result.success:
-                return [result]
-            # If direct also failed, try as carousel (some /p/ posts are albums)
-            logger.info(f"Direct download failed too — trying carousel extraction: {url[:80]}")
-            carousel_opts = _universal_opts(base_prefix + "_carousel_probe.%(ext)s")
-            info2 = None
-            try:
-                carousel_opts_dl = dict(carousel_opts)
-                carousel_opts_dl["extract_flat"] = False
-                with yt_dlp.YoutubeDL(carousel_opts_dl) as ydl:
-                    info2 = ydl.extract_info(url, download=False)
-            except Exception:
-                pass
-            if info2 and info2.get("entries"):
-                entries2 = [e for e in info2["entries"] if e]
-                if entries2:
-                    return _download_carousel(entries2, base_prefix)
-            return [result]  # Return original failure
-        logger.error(f"Could not probe URL: {url[:80]}")
-        return [DownloadResult(False, error="Could not extract info from URL — may be private or unavailable")]
-
-    entries = info.get("entries")
-
-    # ── CASE: CAROUSEL (multiple items) ───────────────────────────────
-    if entries:
-        entries = [e for e in entries if e]
-        total   = len(entries)
-
-        if total == 0:
-            return [DownloadResult(False, error="Carousel had 0 valid entries")]
-
-        # Identify content mix for logging
-        types = [_detect_media_type_from_entry(e) for e in entries]
-        photo_count = types.count("Images")
-        video_count = types.count("Videos")
-
-        if photo_count > 0 and video_count > 0:
-            logger.info(f"Mixed carousel: {photo_count} photo(s) + {video_count} video(s) = {total} total")
-        elif photo_count > 0:
-            logger.info(f"Photo carousel: {photo_count} photo(s)")
-        else:
-            logger.info(f"Video carousel: {video_count} video(s)")
-
-        return _download_carousel(entries, base_prefix)
-
-    # ── CASE: SINGLE ITEM ─────────────────────────────────────────────
-    else:
-        media_type = _detect_media_type_from_entry(info)
-        logger.info(f"Single item [{media_type}]: {url[:80]}")
-
+    # ── REELS / VIDEOS: go straight to yt-dlp, skip probe ─────────────
+    if "/reel/" in url_lower or "/reels/" in url_lower or "/tv/" in url_lower \
+            or "fb.watch" in url_lower or "/videos/" in url_lower or "/watch" in url_lower:
+        logger.info("Reel/video URL — downloading directly with yt-dlp")
         item_prefix = base_prefix + "_single"
+        opts        = _video_opts(item_prefix + ".%(ext)s")
+        result      = _download_entry(url, item_prefix, opts)
+        if not result.success:
+            opts2  = _universal_opts(item_prefix + "_fb.%(ext)s")
+            result = _download_entry(url, item_prefix + "_fb", opts2)
+        return [result]
 
-        if media_type == "Videos":
-            # Try best video quality first
-            opts   = _video_opts(item_prefix + ".%(ext)s")
-            result = _download_entry(url, item_prefix, opts)
+    # ── /p/ POSTS: try yt-dlp probe first, fallback to instagrapi ─────
+    if "/p/" in url_lower:
+        probe_opts = _universal_opts(base_prefix + "_probe.%(ext)s")
+        info       = _extract_info_only(url, probe_opts)
 
-            if not result.success:
-                err_lower = (result.error or "").lower()
-                # If no video found, it might actually be a photo post
-                if "no video formats found" in err_lower or "no video" in err_lower:
-                    logger.info("No video formats found — retrying as photo")
-                    opts2      = _universal_opts(item_prefix + "_ph.%(ext)s")
-                    result     = _download_entry(url, item_prefix + "_ph", opts2)
-                else:
-                    # Generic fallback
-                    logger.info("Video download failed — trying universal fallback")
+        if info is None:
+            probe_opts2 = _video_opts(base_prefix + "_probe2.%(ext)s")
+            info        = _extract_info_only(url, probe_opts2)
+
+        if info is None:
+            # yt-dlp completely failed — use instagrapi for photos
+            logger.info(f"yt-dlp probe failed — switching to instagrapi for: {url[:80]}")
+            return _download_photos_instagrapi(url, base_prefix)
+
+        entries = info.get("entries")
+
+        if entries:
+            entries = [e for e in entries if e]
+            total   = len(entries)
+            if total == 0:
+                logger.info("yt-dlp returned empty entries — switching to instagrapi")
+                return _download_photos_instagrapi(url, base_prefix)
+
+            types       = [_detect_media_type_from_entry(e) for e in entries]
+            photo_count = types.count("Images")
+            video_count = types.count("Videos")
+
+            if photo_count > 0 and video_count > 0:
+                logger.info(f"Mixed carousel: {photo_count} photo(s) + {video_count} video(s)")
+            elif photo_count > 0:
+                logger.info(f"Photo carousel: {photo_count} photo(s)")
+            else:
+                logger.info(f"Video carousel: {video_count} video(s)")
+
+            return _download_carousel(entries, base_prefix)
+
+        else:
+            # Single item
+            media_type  = _detect_media_type_from_entry(info)
+            item_prefix = base_prefix + "_single"
+            logger.info(f"Single item [{media_type}]: {url[:80]}")
+
+            if media_type == "Videos":
+                opts   = _video_opts(item_prefix + ".%(ext)s")
+                result = _download_entry(url, item_prefix, opts)
+                if not result.success:
+                    err_lower = (result.error or "").lower()
+                    if "no video formats found" in err_lower:
+                        logger.info("No video — switching to instagrapi")
+                        return _download_photos_instagrapi(url, base_prefix)
                     opts2  = _universal_opts(item_prefix + "_fb.%(ext)s")
                     result = _download_entry(url, item_prefix + "_fb", opts2)
+                return [result]
+            else:
+                # Photo detected by yt-dlp probe
+                opts   = _universal_opts(item_prefix + ".%(ext)s")
+                result = _download_entry(url, item_prefix, opts)
+                if not result.success:
+                    logger.info("yt-dlp photo download failed — switching to instagrapi")
+                    return _download_photos_instagrapi(url, base_prefix)
+                return [result]
 
-            return [result]
-
-        else:
-            # Photo
-            opts   = _universal_opts(item_prefix + ".%(ext)s")
-            result = _download_entry(url, item_prefix, opts)
-            return [result]
+    # ── UNKNOWN URL FORMAT ─────────────────────────────────────────────
+    logger.warning(f"Unknown URL format, attempting generic yt-dlp: {url[:80]}")
+    item_prefix = base_prefix + "_generic"
+    opts        = _universal_opts(item_prefix + ".%(ext)s")
+    result      = _download_entry(url, item_prefix, opts)
+    return [result]
 
 
 # ─────────────────────────────────────────────
