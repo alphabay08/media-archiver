@@ -3,7 +3,7 @@ import logging
 
 from core.state_manager import StateManager
 from core.retry_controller import is_retryable, should_pause, backoff_delay, inter_download_delay
-from modules.downloader import download
+from modules.downloader import download, download_all
 from modules.dropbox_uploader import upload_file
 from modules.platform_detector import detect_platform, guess_media_type
 
@@ -14,7 +14,7 @@ QUEUE_THRESHOLD        = int(os.environ.get("QUEUE_TRIGGER_THRESHOLD", 3))
 CONSECUTIVE_FAIL_LIMIT = 10
 
 _PERMANENT_ERRORS = [
-    "unsupported url", "cannot parse data", "no video formats found",
+    "unsupported url", "cannot parse data",
     "playlist returned no entries", "private video", "login required",
     "not available", "has been removed", "page not found", "404",
     "content is not available", "this reel can't be played",
@@ -69,11 +69,13 @@ def run_worker(force: bool = False):
                 sm.mark_failed(url, "Unrecognized platform", permanent=True)
                 continue
 
-            result = download(url, platform)
+            # ── DOWNLOAD ALL ITEMS (handles single/carousel/mixed) ──
+            results = download_all(url, platform)
 
-            if not result.success:
-                error = result.error or "Unknown error"
-                logger.error(f"Download failed [{url[:60]}]: {error[:120]}")
+            # ── ALL ITEMS FAILED ────────────────────────────────────
+            if not any(r.success for r in results):
+                error = results[0].error if results else "Unknown error"
+                logger.error(f"All downloads failed [{url[:60]}]: {error[:120]}")
 
                 if _is_permanent(error):
                     sm.mark_failed(url, error, permanent=True)
@@ -90,8 +92,7 @@ def run_worker(force: bool = False):
                 consecutive_failures += 1
                 if consecutive_failures >= CONSECUTIVE_FAIL_LIMIT:
                     sm.mark_failed(url, error)
-                    reason = f"Too many consecutive failures: {error}"
-                    sm.set_worker_status("paused", reason=reason)
+                    sm.set_worker_status("paused", reason="consecutive_failure_limit")
                     return {"status": "paused", "reason": "consecutive_failure_limit"}
 
                 if is_retryable(error):
@@ -101,27 +102,60 @@ def run_worker(force: bool = False):
                     sm.mark_failed(url, error, permanent=True)
                 continue
 
-            consecutive_failures  = 0
-            actual_media_type     = result.media_type or guess_media_type(url)
-            success, path_or_err  = upload_file(result.file_path, platform, actual_media_type)
+            # ── UPLOAD EACH ITEM INCREMENTALLY ──────────────────────
+            consecutive_failures = 0
+            total_items          = len(results)
+            success_items        = [r for r in results if r.success]
+            last_upload_path     = None
+            uploaded_count       = 0
 
-            try:
-                if result.file_path and os.path.exists(result.file_path):
-                    os.remove(result.file_path)
-            except Exception as e:
-                logger.warning(f"Could not delete temp file: {e}")
+            if total_items > 1:
+                logger.info(f"Uploading {len(success_items)}/{total_items} item(s) from: {url[:60]}")
 
-            if success:
-                sm.mark_completed(url, path_or_err)
-                logger.info(f"Completed: {url[:60]} -> {path_or_err}")
-            else:
-                if is_retryable(path_or_err):
-                    sm.mark_failed(url, f"Upload failed: {path_or_err}")
+            for i, result in enumerate(results):
+                item_num = i + 1
+
+                if not result.success:
+                    logger.warning(f"  Skipping item {item_num}/{total_items} (download failed): {result.error[:80]}")
+                    continue
+
+                # Determine media type
+                actual_media_type = result.media_type or guess_media_type(url)
+
+                logger.info(f"  Uploading item {item_num}/{total_items} [{actual_media_type}]...")
+
+                # Upload to Dropbox
+                success, path_or_err = upload_file(result.file_path, platform, actual_media_type)
+
+                # Always clean up temp file after upload attempt
+                try:
+                    if result.file_path and os.path.exists(result.file_path):
+                        os.remove(result.file_path)
+                        logger.debug(f"  Temp file deleted: {result.file_path}")
+                except Exception as e:
+                    logger.warning(f"  Could not delete temp file: {e}")
+
+                if success:
+                    last_upload_path = path_or_err
+                    uploaded_count  += 1
+                    logger.info(f"  ✓ Item {item_num}/{total_items} uploaded: {path_or_err}")
                 else:
-                    sm.mark_failed(url, f"Upload failed: {path_or_err}", permanent=True)
-                logger.error(f"Upload failed [{url[:60]}]: {path_or_err[:120]}")
+                    logger.error(f"  ✗ Item {item_num}/{total_items} upload failed: {path_or_err[:120]}")
+
+            # ── MARK FINAL STATUS ───────────────────────────────────
+            if uploaded_count > 0:
+                sm.mark_completed(url, last_upload_path)
+                logger.info(
+                    f"Completed [{url[:60]}]: "
+                    f"{uploaded_count}/{total_items} item(s) uploaded"
+                )
+            else:
+                sm.mark_failed(url, "All uploads failed", permanent=True)
+                logger.error(f"All uploads failed for: {url[:60]}")
 
             processed_count += 1
+
+            # Delay between different posts (not between items of same post)
             if sm.count_pending() > 0:
                 inter_download_delay()
 
