@@ -1,5 +1,7 @@
 import os
+import time
 import logging
+import logging.handlers
 import threading
 from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
@@ -8,8 +10,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 os.environ.setdefault("DATA_DIR", "/app/data")
-Path("/app/data/tmp").mkdir(parents=True, exist_ok=True)
-Path("/app/logs").mkdir(parents=True, exist_ok=True)
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
+TEMP_DIR = DATA_DIR / "tmp"
+LOG_DIR  = Path("/app/logs")
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 import sys
 sys.path.insert(0, "/app")
@@ -17,25 +24,38 @@ sys.path.insert(0, "/app")
 from core.worker_engine import run_worker
 from core.state_manager import StateManager
 
+# ── LOG ROTATION ───────────────────────────────────────────────────
+# 5MB per file × 3 backups = 15MB max log storage on Render
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("/app/logs/worker.log", encoding="utf-8"),
+        logging.handlers.RotatingFileHandler(
+            filename    = str(LOG_DIR / "worker.log"),
+            maxBytes    = 5 * 1024 * 1024,  # 5MB per file
+            backupCount = 3,                 # 3 backups = 15MB max total
+            encoding    = "utf-8",
+        ),
     ],
 )
 logger = logging.getLogger(__name__)
 
 logger.info("=" * 55)
 logger.info("  Media Archiver Worker v1.3 — Starting")
-logger.info(f"  COOKIES set:     {'yes' if os.environ.get('INSTAGRAM_COOKIES') else 'no'}")
 logger.info(f"  SESSION_B64 set: {'yes' if os.environ.get('INSTAGRAM_SESSION_B64') else 'no'}")
+logger.info(f"  Log rotation:    5MB x 3 = 15MB max")
 logger.info("=" * 55)
 
 app           = FastAPI(title="Media Archiver Worker", version="1.3")
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "")
 _worker_lock  = threading.Lock()
+
+# Cleanup config
+TEMP_MAX_AGE      = int(os.environ.get("TEMP_MAX_AGE_SECONDS",  1800))   # 30 min
+TEMP_CLEAN_EVERY  = int(os.environ.get("TEMP_CLEANUP_INTERVAL", 3600))   # 1 hour
+STATE_PURGE_DAYS  = int(os.environ.get("STATE_PURGE_DAYS",      30))     # 30 days
+STATE_PURGE_EVERY = int(os.environ.get("STATE_PURGE_INTERVAL",  86400))  # daily
 
 
 def _verify(request: Request):
@@ -45,14 +65,71 @@ def _verify(request: Request):
         raise HTTPException(status_code=403, detail="Unauthorized")
 
 
+# ─────────────────────────────────────────────
+# RESOURCE CLEANUP
+# ─────────────────────────────────────────────
+
+def cleanup_orphan_temps():
+    """Delete temp files older than TEMP_MAX_AGE seconds."""
+    try:
+        now = time.time()
+        deleted = freed = 0
+        for f in TEMP_DIR.iterdir():
+            if not f.is_file():
+                continue
+            if (now - f.stat().st_mtime) > TEMP_MAX_AGE:
+                freed += f.stat().st_size
+                f.unlink()
+                deleted += 1
+        if deleted:
+            logger.info(f"Temp cleanup: {deleted} file(s) deleted, {freed/(1024*1024):.1f}MB freed")
+    except Exception as e:
+        logger.warning(f"Temp cleanup error: {e}")
+
+
+def purge_old_state():
+    """Remove completed links older than STATE_PURGE_DAYS from state.json."""
+    try:
+        sm     = StateManager()
+        purged = sm.purge_old_completed(keep_days=STATE_PURGE_DAYS)
+        if purged:
+            logger.info(f"State purge: {purged} completed link(s) older than {STATE_PURGE_DAYS}d removed")
+    except Exception as e:
+        logger.warning(f"State purge error: {e}")
+
+
+def background_cleanup():
+    """Temp cleanup every hour + state purge every day."""
+    logger.info(f"Cleanup worker: temp every {TEMP_CLEAN_EVERY//60}min, state every {STATE_PURGE_EVERY//3600}h")
+    last_state_purge = time.time()
+    while True:
+        time.sleep(TEMP_CLEAN_EVERY)
+        cleanup_orphan_temps()
+        if (time.time() - last_state_purge) >= STATE_PURGE_EVERY:
+            purge_old_state()
+            last_state_purge = time.time()
+
+
+# Run cleanup on startup then start background thread
+logger.info("Startup cleanup...")
+cleanup_orphan_temps()
+purge_old_state()
+threading.Thread(target=background_cleanup, name="CleanupWorker", daemon=True).start()
+logger.info("Background cleanup thread started.")
+
+
+# ─────────────────────────────────────────────
+# ORIGINAL V1 ENDPOINTS — UNCHANGED
+# ─────────────────────────────────────────────
+
 @app.get("/")
 async def root():
     sm = StateManager()
     return {
-        "service": "Media Archiver Worker",
-        "version": "1.3",
+        "service":       "Media Archiver Worker",
+        "version":       "1.3",
         "worker_status": sm.get_worker_status()["status"],
-        "queue": sm.get_queue_summary(),
+        "queue":         sm.get_queue_summary(),
     }
 
 
@@ -119,7 +196,6 @@ async def add_link(request: Request):
 
 @app.post("/add-link")
 async def add_link_legacy(request: Request):
-    """Legacy endpoint — kept for Telegram bot compatibility."""
     return await add_link(request)
 
 
@@ -151,7 +227,20 @@ async def purge_completed(request: Request):
         body = await request.json()
     except Exception:
         pass
-    keep_days = int(body.get("keep_days", 30))
+    keep_days = int(body.get("keep_days", STATE_PURGE_DAYS))
     sm        = StateManager()
     purged    = sm.purge_old_completed(keep_days=keep_days)
     return {"purged": purged, "queue": sm.get_queue_summary()}
+
+
+@app.get("/disk-usage")
+async def disk_usage(request: Request):
+    """Check how much disk space logs, temp, and state are using."""
+    _verify(request)
+    def dir_size(p: Path) -> int:
+        return sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) if p.exists() else 0
+    return {
+        "logs_mb": round(dir_size(LOG_DIR)  / (1024*1024), 2),
+        "temp_mb": round(dir_size(TEMP_DIR) / (1024*1024), 2),
+        "data_mb": round(dir_size(DATA_DIR) / (1024*1024), 2),
+    }
