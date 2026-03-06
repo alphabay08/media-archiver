@@ -232,11 +232,16 @@ def _try_ytdlp(url: str, base_prefix: str) -> list:
     ]
 
     item_prefix = base_prefix + "_ytdlp"
+
+    # FIX 1: outtmpl must use full absolute TEMP_DIR path
+    # Without this yt-dlp saves relative to current working directory
     opts = {
-        "outtmpl":             item_prefix + "_%(autonumber)s.%(ext)s",
+        "outtmpl":             str(TEMP_DIR / (Path(item_prefix).name + "_%(autonumber)s.%(ext)s")),
         "quiet":               True,
         "noprogress":          True,
-        "format":              "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        # FIX 2: simpler format selector — Instagram doesn't always have
+        # separate video+audio streams, so "best" is safer fallback
+        "format":              "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best/best",
         "merge_output_format": "mp4",
         "socket_timeout":      30,
         "retries":             2,
@@ -246,9 +251,15 @@ def _try_ytdlp(url: str, base_prefix: str) -> list:
             "User-Agent":      random.choice(user_agents),
             "Accept-Language": "en-US,en;q=0.9",
         },
+        # FIX 3: extractor args help yt-dlp find formats Instagram hides
+        "extractor_args": {
+            "instagram": {
+                "app_id": ["936619743392459"],
+            }
+        },
     }
 
-    # Add cookies if available — this is the key fix
+    # Add cookies if available
     if cookie_file:
         opts["cookiefile"] = cookie_file
 
@@ -258,6 +269,7 @@ def _try_ytdlp(url: str, base_prefix: str) -> list:
 
         files = _find_downloaded_files(item_prefix)
         if not files:
+            logger.info("  yt-dlp: no files found in TEMP_DIR after download")
             return []
 
         results = []
@@ -294,8 +306,12 @@ def _try_gallery_dl(url: str, base_prefix: str) -> list:
 
     try:
         gallery_dl.config.clear()
-        gallery_dl.config.set((), "directory", [str(TEMP_DIR)])
-        gallery_dl.config.set((), "filename",  Path(item_prefix).name + "_{num}.{extension}")
+        # FIX: set base-directory to absolute TEMP_DIR
+        # Without this gallery-dl creates ./gallery-dl/ subfolder
+        # and files are not found by _find_downloaded_files()
+        gallery_dl.config.set((), "base-directory", str(TEMP_DIR))
+        gallery_dl.config.set((), "directory",      [])
+        gallery_dl.config.set((), "filename",       Path(item_prefix).name + "_{num}.{extension}")
         gallery_dl.config.set((), "retries",   2)
         gallery_dl.config.set((), "timeout",   30)
         gallery_dl.config.set(
