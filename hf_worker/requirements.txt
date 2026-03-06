@@ -2,7 +2,7 @@ fastapi>=0.104.0
 uvicorn>=0.24.0
 python-dotenv>=1.0.0
 requests>=2.31.0
-yt-dlp>=2024.1.1
+yt-dlp
 gallery-dl>=1.27.0
 dropbox>=11.36.0
 instagrapi>=2.0.0
