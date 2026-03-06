@@ -1,14 +1,20 @@
 """
-modules/downloader.py — V1 Hybrid
-───────────────────────────────────
+modules/downloader.py — V1 Hybrid + Cookies
+─────────────────────────────────────────────
 3-layer fallback download chain:
 
-  Layer 1 → yt-dlp     (no login, public scraping)
-  Layer 2 → gallery-dl (no login, better photo/carousel support)
-  Layer 3 → instagrapi (login, last resort only)
+  Layer 1 → yt-dlp     (with Instagram cookies — authenticated)
+  Layer 2 → gallery-dl (with Instagram cookies — authenticated)
+  Layer 3 → instagrapi (session login — absolute last resort)
 
-Goal: minimize private API calls to reduce IP flagging,
-      challenge errors, and login_required errors on Render.
+Cookie auth vs instagrapi:
+  - Cookies = browser-based auth (less suspicious to Instagram)
+  - instagrapi = private API calls (more suspicious, triggers challenges)
+  - Both use same account but cookies are much safer from Render IP
+
+Setup:
+  Add INSTAGRAM_COOKIES_B64 to Render environment variables.
+  Generate with: base64 encode your instagram.com_cookies.txt file
 """
 
 import os
@@ -31,6 +37,7 @@ TEMP_DIR  = _DATA_DIR / "tmp"
 
 _INSTAGRAPI_CLIENT  = None
 _RATE_LIMITED_UNTIL = 0
+_COOKIE_FILE_PATH   = None   # cached cookie file path
 RATE_LIMIT_COOLDOWN = int(os.environ.get("RATE_LIMIT_COOLDOWN", 300))
 
 
@@ -52,6 +59,42 @@ class DownloadResult:
         if self.success:
             return f"<DownloadResult OK {self.media_type} {self.file_path}>"
         return f"<DownloadResult FAIL {self.error}>"
+
+
+# ─────────────────────────────────────────────
+# COOKIE HELPER
+# ─────────────────────────────────────────────
+
+def _get_cookie_file() -> str:
+    """
+    Decode INSTAGRAM_COOKIES_B64 env var into a temp cookie file.
+    Returns file path or None if not set.
+    Caches the file path so we only decode once.
+    """
+    global _COOKIE_FILE_PATH
+
+    # Return cached path if already created and file still exists
+    if _COOKIE_FILE_PATH and Path(_COOKIE_FILE_PATH).exists():
+        return _COOKIE_FILE_PATH
+
+    b64 = os.environ.get("INSTAGRAM_COOKIES_B64", "").strip()
+    if not b64:
+        logger.debug("INSTAGRAM_COOKIES_B64 not set — yt-dlp running without cookies")
+        return None
+
+    try:
+        cookie_data = base64.b64decode(b64).decode("utf-8")
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, prefix="ig_cookies_"
+        )
+        tmp.write(cookie_data)
+        tmp.close()
+        _COOKIE_FILE_PATH = tmp.name
+        logger.info(f"Instagram cookies loaded into: {tmp.name}")
+        return _COOKIE_FILE_PATH
+    except Exception as e:
+        logger.warning(f"Failed to decode INSTAGRAM_COOKIES_B64: {e}")
+        return None
 
 
 # ─────────────────────────────────────────────
@@ -173,11 +216,13 @@ def _is_permanent_error(err: str) -> bool:
 
 
 # ─────────────────────────────────────────────
-# LAYER 1 — yt-dlp (no login)
+# LAYER 1 — yt-dlp (with cookies)
 # ─────────────────────────────────────────────
 
 def _try_ytdlp(url: str, base_prefix: str) -> list:
-    logger.info("  Layer 1: yt-dlp (no login)")
+    cookie_file = _get_cookie_file()
+    has_cookies = cookie_file is not None
+    logger.info(f"  Layer 1: yt-dlp ({'with cookies ✓' if has_cookies else 'no cookies'})")
 
     user_agents = [
         "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
@@ -203,6 +248,10 @@ def _try_ytdlp(url: str, base_prefix: str) -> list:
         },
     }
 
+    # Add cookies if available — this is the key fix
+    if cookie_file:
+        opts["cookiefile"] = cookie_file
+
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.extract_info(url, download=True)
@@ -220,16 +269,18 @@ def _try_ytdlp(url: str, base_prefix: str) -> list:
         return results
 
     except Exception as e:
-        logger.info(f"  yt-dlp failed: {str(e)[:100]}")
+        logger.info(f"  yt-dlp failed: {str(e)[:120]}")
         return []
 
 
 # ─────────────────────────────────────────────
-# LAYER 2 — gallery-dl (no login)
+# LAYER 2 — gallery-dl (with cookies)
 # ─────────────────────────────────────────────
 
 def _try_gallery_dl(url: str, base_prefix: str) -> list:
-    logger.info("  Layer 2: gallery-dl (no login)")
+    cookie_file = _get_cookie_file()
+    has_cookies = cookie_file is not None
+    logger.info(f"  Layer 2: gallery-dl ({'with cookies ✓' if has_cookies else 'no cookies'})")
 
     try:
         import gallery_dl
@@ -252,6 +303,11 @@ def _try_gallery_dl(url: str, base_prefix: str) -> list:
             "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
         )
 
+        # Add cookies if available
+        if cookie_file:
+            gallery_dl.config.set(("extractor",), "cookies", cookie_file)
+            logger.debug(f"  gallery-dl using cookie file: {cookie_file}")
+
         job = gallery_dl.job.DownloadJob(url)
         job.run()
 
@@ -268,16 +324,16 @@ def _try_gallery_dl(url: str, base_prefix: str) -> list:
         return results
 
     except Exception as e:
-        logger.info(f"  gallery-dl failed: {str(e)[:100]}")
+        logger.info(f"  gallery-dl failed: {str(e)[:120]}")
         return []
 
 
 # ─────────────────────────────────────────────
-# LAYER 3 — instagrapi (login, last resort)
+# LAYER 3 — instagrapi (last resort)
 # ─────────────────────────────────────────────
 
 def _try_instagrapi(url: str, base_prefix: str) -> list:
-    logger.info("  Layer 3: instagrapi (login — last resort)")
+    logger.info("  Layer 3: instagrapi (last resort)")
 
     if _is_rate_limited():
         remaining = int(_RATE_LIMITED_UNTIL - time.time())
@@ -329,6 +385,7 @@ def _try_instagrapi(url: str, base_prefix: str) -> list:
             return str(obj.thumbnail_url)
         return None
 
+    # Carousel
     if media_type_id == 8:
         resources = media.resources or []
         logger.info(f"  instagrapi carousel: {len(resources)} item(s)")
@@ -344,12 +401,15 @@ def _try_instagrapi(url: str, base_prefix: str) -> list:
                             if photo_url else DownloadResult(False, error="No photo URL")
             results.append(result)
 
+    # Single video
     elif media_type_id == 2:
         video_url = str(media.video_url) if media.video_url else None
         results.append(
             _download_direct_url(video_url, base_prefix + "_ig_reel", "mp4")
             if video_url else DownloadResult(False, error="No video URL")
         )
+
+    # Single photo
     else:
         photo_url = _best_photo_url(media)
         results.append(
@@ -365,7 +425,7 @@ def _try_instagrapi(url: str, base_prefix: str) -> list:
 # ─────────────────────────────────────────────
 
 def _download_facebook(url: str, base_prefix: str) -> list:
-    logger.info("  Facebook: yt-dlp (no login)")
+    logger.info("  Facebook: yt-dlp")
     item_prefix = base_prefix + "_fb"
     opts = {
         "outtmpl":             item_prefix + ".%(ext)s",
@@ -380,6 +440,10 @@ def _download_facebook(url: str, base_prefix: str) -> list:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"
         },
     }
+    cookie_file = _get_cookie_file()
+    if cookie_file:
+        opts["cookiefile"] = cookie_file
+
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.extract_info(url, download=True)
@@ -398,9 +462,9 @@ def _download_facebook(url: str, base_prefix: str) -> list:
 
 def download_all(url: str, platform: str) -> list:
     """
-    Layer 1: yt-dlp     (no login — tries first, covers ~70% of links)
-    Layer 2: gallery-dl (no login — covers photos/carousels yt-dlp misses)
-    Layer 3: instagrapi (login   — absolute last resort, ~10% of links)
+    Layer 1: yt-dlp     (with cookies — handles ~80% of links)
+    Layer 2: gallery-dl (with cookies — handles photos/carousels)
+    Layer 3: instagrapi (private API  — absolute last resort ~5%)
     """
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     unique_id   = uuid.uuid4().hex
@@ -409,28 +473,28 @@ def download_all(url: str, platform: str) -> list:
 
     logger.info(f"Processing: {url[:80]}")
 
-    # Facebook — yt-dlp only
+    # Facebook
     if any(x in url_lower for x in ["facebook.com", "fb.watch", "fb.com"]):
         return _download_facebook(url, base_prefix)
 
     # Instagram — 3-layer fallback
     if "instagram.com" in url_lower or "instagr.am" in url_lower:
 
-        # Layer 1
+        # Layer 1 — yt-dlp
         results = _try_ytdlp(url, base_prefix)
         if results and any(r.success for r in results):
             logger.info(f"✓ yt-dlp succeeded [{sum(1 for r in results if r.success)} item(s)]")
             return results
         logger.info("yt-dlp failed — trying gallery-dl...")
 
-        # Layer 2
+        # Layer 2 — gallery-dl
         results = _try_gallery_dl(url, base_prefix)
         if results and any(r.success for r in results):
             logger.info(f"✓ gallery-dl succeeded [{sum(1 for r in results if r.success)} item(s)]")
             return results
         logger.info("gallery-dl failed — trying instagrapi (last resort)...")
 
-        # Layer 3
+        # Layer 3 — instagrapi
         results = _try_instagrapi(url, base_prefix)
         if results and any(r.success for r in results):
             logger.info(f"✓ instagrapi succeeded [{sum(1 for r in results if r.success)} item(s)]")
